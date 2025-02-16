@@ -1,9 +1,13 @@
 use anyhow::Result;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, error, Level};
+use std::sync::Arc;
 
 mod config;
+mod pool;
+
 use config::Config;
+use pool::ConnectionPool;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,6 +20,13 @@ async fn main() -> Result<()> {
     
     check_postgres_connection(&config.pg_host, config.pg_port).await?;
     
+    // Initialize the connection pool
+    let pool = ConnectionPool::new(
+        config.max_connections,
+        config.pg_host.clone(),
+        config.pg_port,
+    );
+    
     let listener = TcpListener::bind(format!("{}:{}", 
         config.listen_addr, config.listen_port)).await?;
     
@@ -26,7 +37,8 @@ async fn main() -> Result<()> {
             Ok((client_stream, addr)) => {
                 info!("New connection from: {}", addr);
                 
-                tokio::spawn(handle_connection(client_stream, config.pg_host.clone(), config.pg_port));
+                let pool = Arc::clone(&pool);
+                tokio::spawn(handle_connection(client_stream, pool));
             }
             Err(e) => {
                 error!("Failed to accept connection: {}", e);
@@ -49,13 +61,14 @@ async fn check_postgres_connection(pg_host: &str, pg_port: u16) -> Result<()> {
     }
 }
 
-async fn handle_connection(mut client_stream: TcpStream, pg_host: String, pg_port: u16) -> Result<()> {
-    // Connect to PostgreSQL
-    let mut pg_stream = TcpStream::connect(format!("{}:{}", pg_host, pg_port))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to PostgreSQL: {}", e))?;
+async fn handle_connection(mut client_stream: TcpStream, pool: Arc<ConnectionPool>) -> Result<()> {
+    // Get a connection from the pool
+    let mut pg_conn = pool.get_connection().await?;
+    
+    // Get mutable reference to the underlying connection
+    let pg_stream = pg_conn.get_mut().unwrap();
 
-    match tokio::io::copy_bidirectional(&mut client_stream, &mut pg_stream).await {
+    match tokio::io::copy_bidirectional(&mut client_stream, pg_stream).await {
         Ok((from_client, from_pg)) => {
             info!("Connection closed. Bytes from client: {}, from pg: {}", from_client, from_pg);
             Ok(())
